@@ -11,7 +11,7 @@ from docopt import DocoptExit
 
 from openmaptiles.perfutils import change, PerfSummary, PerfBucket, \
     PerfRoot, TestCase, print_graph
-from openmaptiles.pgutils import show_settings, get_postgis_version
+from openmaptiles.pgutils import show_settings, get_postgis_version, print_connecting
 from openmaptiles.sqltomvt import MvtGenerator
 from openmaptiles.tileset import Tileset
 from openmaptiles.utils import round_td
@@ -103,8 +103,7 @@ class PerfTester:
         self.zooms = list(dict.fromkeys(zooms))
 
     async def run(self):
-        print(f'Connecting to PostgreSQL at {self.pghost}:{self.pgport}, '
-              f'db={self.dbname}, user={self.user}...')
+        print_connecting(self.pghost, self.pgport, self.dbname, self.user)
         async with asyncpg.create_pool(
             database=self.dbname, host=self.pghost, port=self.pgport, user=self.user,
             password=self.password, min_size=1, max_size=1,

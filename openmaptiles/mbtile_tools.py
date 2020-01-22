@@ -2,8 +2,15 @@ import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, Union
 
+import asyncpg
+
+from openmaptiles.pgutils import PgWarnings, get_postgis_version, create_metadata, \
+    show_settings, print_connecting
 from openmaptiles.sqlite_utils import query
+from openmaptiles.sqltomvt import MvtGenerator
+from openmaptiles.tileset import Tileset
 from openmaptiles.utils import print_err
 
 
@@ -178,12 +185,13 @@ class Imputer:
             yield with_key, without_key
 
 
-class Metadata():
-    def __init__(self, mbtiles) -> None:
-        self.mbtiles = mbtiles
+class Metadata:
+    def __init__(self, mbtiles: Union[str, Path]) -> None:
+        self.mbtiles: Path = Path(mbtiles)
 
-    def validate(self, name, value):
-        if name == 'mtime':
+    @staticmethod
+    def validate(name, value):
+        if name == 'mtime' or name == 'planettime':
             try:
                 val = datetime.fromtimestamp(int(value) / 1000.0)
                 return f'{value} ({val.isoformat()})', True
@@ -203,14 +211,14 @@ class Metadata():
         return value, True
 
     def print_all(self):
-        with sqlite3.connect(self.mbtiles) as conn:
+        with sqlite3.connect(str(self.mbtiles)) as conn:
             data = list(query(conn, "SELECT name, value FROM metadata", []))
         width = max((len(v[0]) for v in data))
         for name, value in sorted(data, key=lambda v: v[0] if v[0] != 'json' else 'zz'):
             print(f"{name:{width}} {self.validate(name, value)[0]}")
 
     def get_value(self, name):
-        with sqlite3.connect(self.mbtiles) as conn:
+        with sqlite3.connect(str(self.mbtiles)) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT value FROM metadata WHERE name=?", [name])
             row = cursor.fetchone()
@@ -220,14 +228,66 @@ class Metadata():
             print(row[0])
 
     def set_value(self, name, value):
-        _, is_valid = self.validate(name, value)
-        if not is_valid:
-            raise ValueError(f"Invalid {name}={value}")
-        with sqlite3.connect(self.mbtiles) as conn:
+        self.set_values({name: value})
+
+    def set_values(self, values: Dict[str, Union[str, None]]):
+        for name, val in values.items():
+            _, is_valid = self.validate(name, val)
+            if not is_valid:
+                raise ValueError(f"Invalid {name}={val}")
+        with sqlite3.connect(str(self.mbtiles)) as conn:
             cursor = conn.cursor()
-            if value is None:
-                cursor.execute("DELETE FROM metadata WHERE name=?;", [name])
-            else:
-                cursor.execute(
-                    "INSERT OR REPLACE INTO  metadata(name, value) VALUES (?, ?);",
-                    [name, value])
+            for name, val in values.items():
+                if val is None:
+                    cursor.execute("DELETE FROM metadata WHERE name=?;", [name])
+                else:
+                    if isinstance(val, list):
+                        val = ','.join((str(v) for v in val))
+                    elif isinstance(val, (int, float)) and not isinstance(val, bool):
+                        val = str(val)
+
+                    if not isinstance(val, str):
+                        raise ValueError(f"Value {name}={val} has an unexpected "
+                                         f"type {type(val)}")
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO  metadata(name, value) VALUES (?, ?);",
+                        [name, val])
+
+
+class MetadataGenerator:
+    def __init__(self, mbtiles: str, tileset: Union[str, Tileset], url_prefix: str,
+                 pghost: str, pgport: str, dbname: str, user: str, password: str):
+        self.mbtiles = Path(mbtiles)
+        self.tileset = tileset
+        self.url_prefix = url_prefix
+        self.pghost = pghost
+        self.pgport = pgport
+        self.dbname = dbname
+        self.user = user
+        self.password = password
+
+    async def init_metadata(self):
+        values = await self.get_metadata()
+        metadata = Metadata(self.mbtiles)
+        print(f"Updating {metadata} metadata table...")
+        val = dict(vector_layers=values['vector_layers'])
+        metadata.set_value('json', json.dumps(val, separators=(',', ':')))
+        print("Metadata has been updated, the new values are:")
+        metadata.print_all()
+
+    async def get_metadata(self):
+        print_connecting(self.pghost, self.pgport, self.dbname, self.user)
+        pg_conn = await asyncpg.connect(
+            database=self.dbname, host=self.pghost, port=self.pgport,
+            user=self.user, password=self.password)
+        try:
+            PgWarnings(pg_conn)
+            await show_settings(pg_conn)
+            print("\nCollecting metadata...")
+            mvt = MvtGenerator(
+                self.tileset,
+                postgis_ver=await get_postgis_version(pg_conn),
+                zoom='$1', x='$2', y='$3')
+            return await create_metadata(pg_conn, mvt, self.url_prefix)
+        finally:
+            await pg_conn.close(timeout=1)

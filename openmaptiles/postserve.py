@@ -12,7 +12,8 @@ from tornado.log import access_log
 # noinspection PyUnresolvedReferences
 from tornado.web import Application, RequestHandler
 
-from openmaptiles.pgutils import show_settings, get_postgis_version, PgWarnings
+from openmaptiles.pgutils import show_settings, get_postgis_version, PgWarnings, \
+    create_metadata, print_connecting
 from openmaptiles.sqltomvt import MvtGenerator
 from openmaptiles.tileset import Tileset
 
@@ -131,7 +132,8 @@ class GetMetadata(RequestHandledWithCors):
 
 class Postserve:
     pool: Pool
-    mvt: MvtGenerator
+    metadata: Dict[str, Any]
+    generated_query: str
 
     def __init__(self, url, port, pghost, pgport, dbname, user, password,
                  layers, tileset_path, sql_file, key_column, disable_feature_ids,
@@ -153,31 +155,12 @@ class Postserve:
         self.test_geometry = test_geometry
         self.verbose = verbose
 
-        self.tileset = Tileset.parse(self.tileset_path)
-
-        self.metadata: Dict[str, Any] = dict(
-            format="pbf",
-            name=self.tileset.name,
-            id=self.tileset.id,
-            bounds=self.tileset.bounds,
-            center=self.tileset.center,
-            maxzoom=self.tileset.maxzoom,
-            minzoom=self.tileset.minzoom,
-            version=self.tileset.version,
-            attribution=self.tileset.attribution,
-            description=self.tileset.description,
-            pixel_scale=self.tileset.pixel_scale,
-            tilejson="2.0.0",
-            tiles=[f"{self.url}" + "/tiles/{z}/{x}/{y}.pbf"],
-            vector_layers=[],
-        )
-
     async def init_connection(self):
-
+        tileset = Tileset.parse(self.tileset_path)
         async with self.pool.acquire() as conn:
             await show_settings(conn)
-            self.mvt = MvtGenerator(
-                self.tileset,
+            mvt = MvtGenerator(
+                tileset,
                 postgis_ver=await get_postgis_version(conn),
                 zoom='$1', x='$2', y='$3',
                 layer_ids=self.layer_ids,
@@ -187,32 +170,12 @@ class Postserve:
                 test_geometry=self.test_geometry,
                 exclude_layers=self.exclude_layers,
             )
-            pg_types = await get_sql_types(conn)
-            for layer_id, layer in self.mvt.get_layers():
-                fields = await self.mvt.validate_layer_fields(conn, layer_id, layer)
-                unknown = {
-                    name: oid
-                    for name, oid in fields.items() if oid not in pg_types
-                }
-                if unknown:
-                    print(f"Ignoring fields with unknown SQL types (OIDs): "
-                          f"[{', '.join([f'{n} ({o})' for n, o in unknown.items()])}]")
-
-                self.metadata["vector_layers"].append(dict(
-                    id=layer.id,
-                    fields={name: pg_types[type_oid]
-                            for name, type_oid in fields.items()
-                            if type_oid in pg_types},
-                    maxzoom=self.metadata["maxzoom"],
-                    minzoom=self.metadata["minzoom"],
-                    description=layer.description,
-                ))
+            self.metadata = await create_metadata(conn, mvt, self.url + '/tiles/')
+            self.generated_query = mvt.generate_sql()
 
     def serve(self):
         access_log.setLevel(logging.INFO if self.verbose else logging.ERROR)
-
-        print(f'Connecting to PostgreSQL at {self.pghost}:{self.pgport}, '
-              f'db={self.dbname}, user={self.user}...')
+        print_connecting(self.pghost, self.pgport, self.dbname, self.user)
         io_loop = IOLoop.current()
         self.pool = io_loop.run_sync(partial(
             create_pool,
@@ -225,7 +188,7 @@ class Postserve:
                 query = stream.read()
             print(f'Loaded {self.sql_file}')
         else:
-            query = self.mvt.generate_sql()
+            query = self.generated_query
 
         if self.verbose:
             print(f'Using SQL query:\n\n-------\n\n{query}\n\n-------\n\n')
@@ -249,21 +212,3 @@ class Postserve:
         print(f"Postserve started, listening on 0.0.0.0:{self.port}")
         print(f"Use {self.url} as the data source")
         IOLoop.instance().start()
-
-
-async def get_sql_types(connection: Connection):
-    """
-    Get Postgres types that we can handle,
-    and return the mapping of OSM type id (oid) => MVT style type
-    """
-    sql_to_mvt_types = dict(
-        bool="Boolean",
-        text="String",
-        int4="Number",
-        int8="Number",
-    )
-    types = await connection.fetch(
-        "select oid, typname from pg_type where typname = ANY($1::text[])",
-        list(sql_to_mvt_types.keys())
-    )
-    return {row['oid']: sql_to_mvt_types[row['typname']] for row in types}

@@ -1,11 +1,11 @@
-import re
 from os import getenv
-from typing import Tuple, Dict, Union
+from typing import Dict, Union
 
 import asyncpg
 from asyncpg import UndefinedFunctionError, UndefinedObjectError, Connection
 
 from openmaptiles.perfutils import COLOR
+from openmaptiles.sqltomvt import MvtGenerator
 from openmaptiles.utils import coalesce, print_err
 
 
@@ -96,3 +96,74 @@ class PgWarnings:
         for msg in self.messages:
             self.print_message(msg)
         self.messages = []
+
+
+async def create_metadata(pg_conn: Connection,
+                          mvt_generator: MvtGenerator, url_prefix: str):
+    """Get mbtiles metadata based on the tileset and PG connection"""
+    vector_layers = []
+    unknown_fields = {}
+    tileset = mvt_generator.tileset
+    pg_types = await get_sql_types(pg_conn)
+    for layer_id, layer in mvt_generator.get_layers():
+        fields = await mvt_generator.validate_layer_fields(pg_conn, layer_id, layer)
+        unknown = {
+            name: oid
+            for name, oid in fields.items() if oid not in pg_types
+        }
+        if unknown:
+            unknown_fields[layer_id] = unknown
+        vector_layers.append(dict(
+            id=layer.id,
+            fields={name: pg_types[type_oid]
+                    for name, type_oid in fields.items()
+                    if type_oid in pg_types},
+            maxzoom=tileset.maxzoom,
+            minzoom=tileset.minzoom,
+            description=layer.description,
+        ))
+    if unknown_fields:
+        msg = "Some of the layer field(s) have unknown SQL types (OIDs):"
+        for lid, fields in unknown_fields.items():
+            msg += f"Layer {lid}: "
+            msg += ', '.join([f'{n} ({o})' for n, o in fields.items()])
+        raise ValueError(msg)
+
+    return dict(
+        format="pbf",
+        name=tileset.name,
+        id=tileset.id,
+        bounds=tileset.bounds,
+        center=tileset.center,
+        maxzoom=tileset.maxzoom,
+        minzoom=tileset.minzoom,
+        version=tileset.version,
+        attribution=tileset.attribution,
+        description=tileset.description,
+        pixel_scale=tileset.pixel_scale,
+        tilejson="2.0.0",
+        tiles=[url_prefix + "/{z}/{x}/{y}.pbf"],
+        vector_layers=vector_layers,
+    )
+
+
+async def get_sql_types(pg_conn: Connection):
+    """
+    Get Postgres types that we can handle,
+    and return the mapping of OSM type id (oid) => MVT style type
+    """
+    sql_to_mvt_types = dict(
+        bool="Boolean",
+        text="String",
+        int4="Number",
+        int8="Number",
+    )
+    types = await pg_conn.fetch(
+        "select oid, typname from pg_type where typname = ANY($1::text[])",
+        list(sql_to_mvt_types.keys())
+    )
+    return {row['oid']: sql_to_mvt_types[row['typname']] for row in types}
+
+
+def print_connecting(pghost: str, pgport: str, dbname: str, user: str) -> None:
+    print(f'Connecting to PostgreSQL at {pghost}:{pgport}, db={dbname}, user={user}...')

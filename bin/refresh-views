@@ -33,7 +33,7 @@ import asyncpg
 from docopt import docopt
 
 import openmaptiles
-from openmaptiles.pgutils import parse_pg_args
+from openmaptiles.pgutils import parse_pg_args, print_connecting
 from openmaptiles.utils import Action, run_actions
 
 
@@ -94,7 +94,7 @@ UNION ALL
 
 async def async_main(schema, dbname, pghost, pgport, user, password, max_queries,
                      verbose):
-    print(f'Connecting to PostgreSQL at {pghost}:{pgport}, db={dbname}, user={user}...')
+    print_connecting(pghost, pgport, dbname, user)
     async with asyncpg.create_pool(
         database=dbname, host=pghost, port=pgport, user=user, password=password,
         min_size=1, max_size=max_queries,

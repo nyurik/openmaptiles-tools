@@ -7,11 +7,17 @@ Usage:
   mbtiles-tools impute <mbtilesfile> --zoom=<zoom>
                 [--key=<hash>... | --keyfile=<file>] [--output=<file>]
                 [--verbose]
-  mbtiles-tools meta-all <mbtilesfile>
+  mbtiles-tools meta-init <mbtilesfile> <tileset> [--url=<urlprefix>]
+                [--pghost=<host>] [--pgport=<port>] [--dbname=<db>]
+                [--user=<user>] [--password=<password>]
+  mbtiles-tools meta-list <mbtilesfile>
   mbtiles-tools meta-get <mbtilesfile> <metakey>
   mbtiles-tools meta-set <mbtilesfile> <metakey> [<newvalue>]
   mbtiles-tools --help
   mbtiles-tools --version
+
+  <mbtilesfile>    .mbtiles file, see https://github.com/mapbox/mbtiles-spec
+  <tileset>        Tileset definition yaml file
 
 Actions:
   find-dups Get a list of duplicate tile keys at a given zoom levels (optional),
@@ -21,7 +27,8 @@ Actions:
             add tiles at the higher zooms with the same content as the found ones.
             For example, given a key for an empty water tile, one could clone all such
             water tiles from zoom 13 to zoom 14 by using --zoom=14 --key=<hash>
-  meta-all  validates and prints all values in the metadata table
+  meta-init initializes metadata from tileset file and a live PostgreSQL connection.
+  meta-list validates and prints all values in the metadata table
   meta-get  Gets a single value from metadata table
   meta-set  Sets a single value in the metadata table, or deletes it if no value.
 
@@ -32,18 +39,31 @@ Options:
   -k --key=<hash>       Key of the tile (i.e. an MD5 hash). Could be multiple.
   -f --keyfile=<file>   A file with tile Keys, one per line.
   -o --output=<file>    Write a list of tiles to this file. Use '-' for stdout.
+  -u --url=<urlprefix>  Metadata tiles URL prefix  [default: /tiles]
   -v --verbose          Print additional debugging information.
   --maxsize=<size>      Ensure tile size is no bigger than <size>.
   --force               Force action, see action description.
   --help                Show this screen.
   --version             Show version.
+
+PostgreSQL Options:
+  -h --pghost=<host>    Postgres hostname. By default uses PGHOST env or "localhost" if not set.
+  -P --pgport=<port>    Postgres port. By default uses PGPORT env or "5432" if not set.
+  -d --dbname=<db>      Postgres db name. By default uses PGDATABASE env or "openmaptiles" if not set.
+  -U --user=<user>      Postgres user. By default uses PGUSER env or "openmaptiles" if not set.
+  --password=<password> Postgres password. By default uses PGPASSWORD env or "openmaptiles" if not set.
+
+These legacy environment variables should not be used, but they are still supported:
+  POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
 """
 from pathlib import Path
 
+import asyncio
 from docopt import docopt, DocoptExit
-import openmaptiles
 
-from openmaptiles.mbtile_tools import Imputer, KeyFinder, Metadata
+import openmaptiles
+from openmaptiles.mbtile_tools import Imputer, KeyFinder, Metadata, MetadataGenerator
+from openmaptiles.pgutils import parse_pg_args
 
 
 def main():
@@ -52,7 +72,13 @@ def main():
         find_dups(args)
     elif args['impute']:
         impute(args)
-    elif args['meta-all']:
+    elif args['meta-init']:
+        pghost, pgport, dbname, user, password = parse_pg_args(args)
+        generator = MetadataGenerator(
+            args['<mbtilesfile>'], args['<tileset>'], args['--url'],
+            pghost, pgport, dbname, user, password)
+        asyncio.run(generator.init_metadata())
+    elif args['meta-list']:
         Metadata(args['<mbtilesfile>']).print_all()
     elif args['meta-get']:
         Metadata(args['<mbtilesfile>']).get_value(args['<metakey>'])

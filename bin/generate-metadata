@@ -70,7 +70,7 @@ def update_metadata(mbtiles_file, metadata, force=False):
             for row in cursor:
                 try:
                     maxzoom = int(row[1])
-                except:
+                except ValueError:
                     maxzoom = 0
                 break
             if maxzoom > 0:
@@ -79,7 +79,7 @@ def update_metadata(mbtiles_file, metadata, force=False):
                     layer['maxzoom'] = maxzoom
         # Save json back into metadata minified
         metadata_json = json.dumps(obj, separators=(',', ':'))
-        cursor.execute("REPLACE INTO metadata VALUES (?, ?)", ('json', metadata_json, ))
+        cursor.execute("REPLACE INTO metadata VALUES (?, ?)", ('json', metadata_json))
         conn.commit()
 
     conn.commit()
